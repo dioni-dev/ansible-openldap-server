@@ -1,0 +1,684 @@
+- name: "Collection community.general version check ({{ lookup('community.general.collection_version', 'community.general') }})"
+  assert:
+    that:
+      - lookup('community.general.collection_version', 'community.general') is version('6.4.0','>=')
+    msg: "Required version is 6.4.0, this is {{lookup('community.general.collection_version', 'community.general') }}"
+    quiet: true
+
+- name: "Debian 10+ required"
+  assert:
+    that:
+      - ansible_distribution == "Debian"
+      - ansible_distribution_major_version is version('10','>=')
+    msg: "Only Debian 10+ is supported, this is {{ ansible_distribution }} {{ ansible_distribution_major_version }}"
+    quiet: true
+
+- name: "get package facts for detecting rsyslog and syslog-ng"
+  package_facts:
+    manager: "apt"
+
+- name: "delete /etc/logrotate.d/slapd.conf if it exists"
+  file:
+    path: /etc/logrotate.d/slapd.conf
+    state: absent
+
+- name: "set up separate log for slapd using rsyslog"
+  when: "'rsyslog' in ansible_facts.packages"
+  block:
+    - name: "set separate log file using rsyslog"
+      copy:
+        dest: /etc/rsyslog.d/slapd.conf
+        content: |
+          :programname, isequal, "slapd" /var/log/slapd.log
+          & stop
+      register: rsyslog_slapd
+    - name: "set logrotate for slapd"
+      copy:
+        dest: /etc/logrotate.d/slapd
+        content: |
+          /var/log/slapd.log {
+              rotate 4
+              weekly
+              notifempty
+              missingok
+              compress
+              create
+              postrotate
+                  /usr/lib/rsyslog/rsyslog-rotate
+              endscript
+          }
+    - name: "restart rsyslog service"
+      when: rsyslog_slapd.changed
+      systemd:
+        name: rsyslog
+        state: restarted
+
+- name: "set up separate log for slapd using syslog-ng"
+  when: "'syslog-ng' in ansible_facts.packages"
+  block:
+    - name: "set separate log file using syslog-ng"
+      copy:
+        dest: /etc/syslog-ng/conf.d/slapd.conf
+        content: |
+          #
+          # log slapd to a separate file only
+          #
+          destination d_slapd {
+            file("/var/log/slapd.log");
+          };
+          filter f_slapd {
+            program("slapd");
+          };
+          log {
+            source(s_src);
+            filter(f_slapd);
+            destination(d_slapd);
+          };
+      register: syslogng_slapd
+    - name: "set logrotate for slapd"
+      copy:
+        dest: /etc/logrotate.d/slapd
+        content: |
+          /var/log/slapd.log {
+              rotate 4
+              weekly
+              notifempty
+              missingok
+              compress
+              create
+              postrotate
+                  invoke-rc.d syslog-ng reload > /dev/null
+              endscript
+          }
+    - name: "restart syslog-ng service"
+      when: syslogng_slapd.changed
+      systemd:
+        name: syslog-ng
+        state: restarted
+
+- name: "compute base DN"
+  set_fact:
+    ldap_basedn: '{{ "dc=" + ldap_domain.split(".") | join(",dc=") }}'
+
+- name: "compute data admin DN"
+  set_fact:
+    ldap_data_admin_dn: '{{ "cn=admin," + ldap_basedn }}'
+
+- name: "backports repo"
+  when: ansible_distribution_major_version in ['10']
+  apt_repository:
+    repo: "deb http://deb.debian.org/debian {{ ansible_distribution_release }}-backports main"
+    state: present
+    filename: "{{ ansible_distribution_release }}-backports"
+    update_cache: yes
+
+# available debconf options for slapd are in https://salsa.debian.org/openldap-team/openldap/-/blob/master/debian/slapd.templates
+- name: "configure domain for OpenLDAP using debconf"
+  debconf:
+    name: slapd
+    question: slapd/domain
+    vtype: string
+    value: '{{ ldap_domain }}'
+
+- name: "configure attribute o for top entry using debconf"
+  debconf:
+    name: slapd
+    question: shared/organization
+    vtype: string
+    value: "{{ ldap_top_organization }}"
+
+- name: "configure purging OpenLDAP database when uninstalling using debconf"
+  debconf:
+    name: slapd
+    question: slapd/purge_database
+    vtype: boolean
+    value: 'true'
+
+- name: "configure data admin password for OpenLDAP using debconf"
+  debconf:
+    name: slapd
+    question: "{{ item }}"
+    vtype: password
+    value: "{{ ldap_data_password }}"
+  # wrongly reports as changed even when not changed, see https://github.com/ansible/ansible/issues/47676
+  changed_when: False
+  no_log: True
+  loop:
+    - slapd/password1
+    - slapd/password2
+
+- name: "install software packages"
+  apt:
+    state: present
+    default_release: "{{ '' if ansible_distribution_major_version=='12' else ansible_distribution_release+'-backports' }}"
+    name:
+      - slapd
+      - ldap-utils
+      - python3-ldap
+
+# libldap-common is a dependency for python-apt so it is already installed in older version
+# and thus not upgraded by the previous step
+- name: "update libldap-common to latest version"
+  apt:
+    state: latest
+    default_release: "{{ '' if ansible_distribution_major_version=='12' else ansible_distribution_release+'-backports' }}"
+    name: libldap-common
+
+- name: "make sure the /etc/ldap/ldap.conf file exists (it is part of package libldap-common)"
+  template:
+    backup: true
+    src: ldap.conf.j2
+    dest: /etc/ldap/ldap.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: "get fresh package facts after installing slapd"
+  package_facts:
+    manager: "apt"
+- name: "detect slapd package version"
+  set_fact:
+    slapd_24: >-
+      {{ ansible_facts.packages['slapd'][0].version is version('2.4', '>=')
+      and ansible_facts.packages['slapd'][0].version is version('2.5', '<') }}
+- name: "decide argon2 module name (different in 2.4 and 2.5 versions)"
+  set_fact:
+    argon2_module_name: "{{ 'pw-argon2' if slapd_24 else 'argon2' }}"
+    default_hash: "{{ '{ARGON2}' if ldap_strong_password_hashing else '{SHA}' }}"
+- name: "decide parameters for slappasswd"
+  set_fact:
+    slappasswd_argv: >
+      {{ [ 'slappasswd', '-h', default_hash ] +
+         ( [ '-o', 'module-load=/usr/lib/ldap/'+argon2_module_name+'.so' ] if  ldap_strong_password_hashing else [] )
+      }}
+- debug:
+    msg: >-
+      slapd version: {{ ansible_facts.packages['slapd'][0].version }}
+      slapd_24: {{ slapd_24 }}
+      argon2 module: {{ argon2_module_name }}
+      slappasswd_argv: {{ slappasswd_argv }}
+
+- name: "install slapd-contrib with Argon2 key derivation function"
+  when: ldap_strong_password_hashing and slapd_24
+  apt:
+    default_release: "{{ ansible_distribution_release }}-backports"
+    name: slapd-contrib
+    state: present
+
+- name: "hold slapd package from upgrading"
+  when: ldap_hold_package
+  dpkg_selections:
+    name: slapd
+    selection: hold
+
+- name: "compute config admin password hash (not idempotent for salted hashes)"
+  command:
+    argv: "{{ slappasswd_argv + [ '-s', ldap_config_password ] }}"
+  register: ldap_config_admin_password_hash
+  changed_when: False
+  no_log: True
+
+- name: "set config admin password"
+  ldap_attrs:
+    dn: olcDatabase={0}config,cn=config
+    attributes:
+      olcRootPW: "{{ ldap_config_admin_password_hash.stdout }}"
+    state: exact
+  no_log: True
+
+- name: "compute data admin password hash (not idempotent for salted hashes)"
+  when: ldap_strong_password_hashing
+  command:
+    argv: "{{ slappasswd_argv + [ '-s', ldap_data_password ] }}"
+  register: ldap_data_admin_password_hash
+  changed_when: False
+  no_log: True
+
+- name: "set data admin password"
+  when: ldap_strong_password_hashing
+  ldap_attrs:
+    dn: olcDatabase={1}mdb,cn=config
+    attributes:
+      olcRootPW: "{{ ldap_data_admin_password_hash.stdout }}"
+    state: exact
+  no_log: True
+
+- name: "add openldap user to ssl-cert group"
+  user:
+    name: openldap
+    groups: ssl-cert
+    append: yes
+  register: openldap_ssl_cert_group
+
+- name: "restart OpenLDAP after openldap user added to group ssl-cert"
+  service:
+    name: slapd
+    state: restarted
+  when: openldap_ssl_cert_group.changed
+
+- name: "modify LDAP TLS settings"
+  ldap_attrs:
+    dn: cn=config
+    attributes:
+      olcTLSCertificateFile: "{{ ldap_certificate_file }}"
+      olcTLSCertificateKeyFile: "{{ ldap_certificate_key_file }}"
+      olcTLSCACertificateFile: "{{ ldap_certificate_chain_file }}"
+    state: exact
+  register: ssl_ldif
+
+- name: "enable secure port, plain ldap and local connection"
+  lineinfile:
+    dest: /etc/default/slapd
+    regexp: ^SLAPD_SERVICES=
+    line: SLAPD_SERVICES="ldaps:/// ldapi:/// ldap:///"
+  register: secure_port_enabled
+
+- name: "restart OpenLDAP after enabling TLS"
+  service:
+    name: slapd
+    state: restarted
+  when: secure_port_enabled.changed or ssl_ldif.changed
+
+- name: "set olcDbMaxSize on olcDatabase={1}mdb"
+  ldap_attrs:
+    dn: "olcDatabase={1}mdb,cn=config"
+    attributes:
+      olcDbMaxSize: "{{ ldap_mdb1_olcDbMaxSize }}"
+    state: exact
+
+- name: "size in MiB"
+  debug:
+    msg: "olcDbMaxSize is {{ ldap_mdb1_olcDbMaxSize / (1024 * 1024) }} MiB"
+
+- name: "pass-through authentication"
+  when: ldap_pass_through_authentication
+  block:
+    - name: "install kerberos and sasl"
+      apt:
+        name:
+          - krb5-user
+          - sasl2-bin
+        state: present
+    - name: "krb5.conf"
+      get_url:
+        url: https://metavo.metacentrum.cz/krb5.conf
+        dest: /etc/krb5.conf
+        force: yes
+    - name: "saslauthd START=yes"
+      lineinfile:
+        path: /etc/default/saslauthd
+        regexp: 'START='
+        line: 'START=yes'
+      register: saslauthd1
+    - name: "saslauthd MECHANISMS=kerberos5"
+      lineinfile:
+        path: /etc/default/saslauthd
+        regexp: 'MECHANISMS='
+        line: 'MECHANISMS="kerberos5"'
+      register: saslauthd2
+    - name: "restart saslauthd"
+      service:
+        name: saslauthd
+        state: restarted
+      when: saslauthd1.changed or saslauthd2.changed
+    - name: "sasl2 config"
+      copy:
+        dest: /usr/lib/sasl2/slapd.conf
+        content: |
+          pwcheck_method: saslauthd
+          mech_list: plain login external
+      register: sasl_first_pass
+    - name: "add user openldap to group sasl"
+      user:
+        name: openldap
+        groups: sasl
+        append: yes
+    - name: "restart OpenLDAP after enabling SASL"
+      service:
+        name: slapd
+        state: restarted
+      when: sasl_first_pass.changed
+
+- name: "OpenLDAP modules"
+  block:
+    - name: "modules lists"
+      set_fact:
+        olcModuleLoad_values: [ 'back_mdb' ]
+    - name: "modules for master replica"
+      when: ldap_master_replica
+      set_fact:
+        olcModuleLoad_values: "{{ olcModuleLoad_values +  [ 'syncprov', 'accesslog' ] }}"
+    - name: "modules for memberOf overlay"
+      when: ldap_memberOf_overlay
+      set_fact:
+        olcModuleLoad_values: "{{ olcModuleLoad_values +  [ 'memberof', 'refint' ] }}"
+    - name: "module for sssvlv overlay"
+      when: ldap_sssvlv_overlay
+      set_fact:
+        olcModuleLoad_values: "{{ olcModuleLoad_values +  [ 'sssvlv' ] }}"
+    - name: "module argon2"
+      when: ldap_strong_password_hashing
+      set_fact:
+        olcModuleLoad_values: "{{ olcModuleLoad_values +  [ argon2_module_name ] }}"
+    - name: "activate modules {{ olcModuleLoad_values }}"
+      ldap_attrs:
+        dn: cn=module{0},cn=config
+        attributes:
+          olcModuleLoad: "{{ olcModuleLoad_values }}"
+        ordered: yes
+        state: present
+
+- name: "set strong hashing method as default for password hashing"
+  when: ldap_strong_password_hashing
+  ldap_attrs:
+    dn: "olcDatabase={-1}frontend,cn=config"
+    attributes:
+      olcPasswordHash: "{ARGON2}"
+    state: exact
+
+- name: "create users"
+  include_tasks: user_entry.yml
+  loop: "{{ ldap_users }}"
+  loop_control:
+    loop_var: user_entry
+
+- name: "create replica user"
+  when: ldap_master_replica
+  include_tasks: user_entry.yml
+  vars:
+    user_entry:
+      user: 'replication'
+      password: "{{ ldap_replication_password }}"
+      description: "user for LDAP replication"
+
+- name: "LDAP access rules"
+  when: ldap_access_rules_set
+  block:
+    - name: "LDAP access rules empty"
+      set_fact:
+        olcAccess_values: []
+        oldAccess_replication:
+          - >-
+            to dn.subtree="{{ ldap_basedn }}"
+            by dn.exact="cn=replication,{{ ldap_basedn }}" read
+            by * break
+    - name: "LDAP access rule for replication must be first"
+      when: ldap_master_replica
+      set_fact:
+        olcAccess_values: "{{ olcAccess_values + oldAccess_replication }}"
+    - name: "LDAP access rules start"
+      set_fact:
+        olcAccess_values: "{{ olcAccess_values + ldap_access_rules_start }}"
+    - name: "additional LDAP access rules"
+      set_fact:
+        olcAccess_values: "{{ olcAccess_values + ldap_access_rules_additional }}"
+    - name: "LDAP access rules end"
+      set_fact:
+        olcAccess_values: "{{ olcAccess_values + ldap_access_rules_end }}"
+    - name: "modify OpenLDAP access rights"
+      ldap_attrs:
+        dn: olcDatabase={1}mdb,cn=config
+        attributes:
+          olcAccess: "{{ olcAccess_values }}"
+        ordered: yes
+        state: exact
+
+- name: "set unlimited size of searches"
+  ldap_attrs:
+    dn: olcDatabase={-1}frontend,cn=config
+    attributes:
+      olcSizeLimit: "{{ ldap_size_limit }}"
+    state: exact
+
+- name: "master replica"
+  when: ldap_master_replica
+  block:
+    - name: "no limits for replica"
+      ldap_attrs:
+        dn: olcDatabase={1}mdb,cn=config
+        attributes:
+          olcLimits:
+            - 'dn.exact="cn=replication,{{ ldap_basedn }}" time=unlimited size=unlimited'
+        ordered: yes
+        state: exact
+
+    - name: "directory for accesslog"
+      file:
+        path: /var/lib/ldap/accesslog
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: '0700'
+
+    - name: "accesslog database"
+      ldap_entry:
+        dn: "olcDatabase={2}mdb,cn=config"
+        xorder_discovery: disable
+        objectClass:
+          - olcDatabaseConfig
+          - olcMdbConfig
+        attributes:
+          olcDatabase: '{2}mdb'
+          olcDbDirectory: /var/lib/ldap/accesslog
+          olcSuffix: cn=accesslog
+          olcAccess: '{0}to dn.subtree="cn=accesslog" by dn.exact="cn=replication,{{ ldap_basedn }}" read'
+          olcLastMod: 'TRUE'
+          olcMaxDerefDepth: 15
+          olcReadOnly: 'FALSE'
+          olcLimits: 'dn.exact="cn=replication,{{ ldap_basedn }}" time=unlimited size=unlimited'
+          olcSizeLimit: unlimited
+          olcTimeLimit: unlimited
+          olcMonitoring: 'TRUE'
+          olcDbCheckpoint: '0 0'
+          olcDbIndex:
+            - entryCSN eq
+            - objectClass eq
+            - reqEnd eq
+            - reqResult eq
+            - reqStart eq
+            - reqDN eq
+          olcDbMode: '0600'
+          olcDbSearchStack: 16
+          olcDbMaxsize: 85899345920
+        state: present
+
+    - name: "accesslog overlay for main database"
+      ldap_entry:
+        dn: "olcOverlay=accesslog,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcAccessLogConfig
+        attributes:
+          olcOverlay: 'accesslog'
+          olcAccessLogDb: cn=accesslog
+          olcAccessLogOps: writes
+          olcAccessLogSuccess: 'TRUE'
+          olcAccessLogPurge: '2+00:00 1+00:00'
+        state: present
+
+    - name: "syncprov overlay for main database"
+      ldap_entry:
+        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: 'syncprov'
+          olcSpCheckpoint: '100 10'
+        state: present
+
+    - name: "syncprov overlay for accesslog database"
+      ldap_entry:
+        dn: "olcOverlay=syncprov,olcDatabase={2}mdb,cn=config"
+        objectClass:
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: 'syncprov'
+          olcSpCheckpoint: '100 10'
+          olcSpNoPresent: 'TRUE'
+          olcSpReloadHint: 'TRUE'
+        state: present
+
+    - name: "syncprov overlay for config database"
+      ldap_entry:
+        dn: "olcOverlay=syncprov,olcDatabase={0}config,cn=config"
+        objectClass:
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: 'syncprov'
+        state: present
+
+    - name: "modify ACL for config db to allow replication to read schemas"
+      ldap_attrs:
+        dn: olcDatabase={0}config,cn=config
+        attributes:
+          olcAccess: >-
+            {0}to dn.subtree="cn=schema,cn=config" 
+            by dn.exact="cn=replication,{{ ldap_basedn }}" read
+            by * break
+        state: present
+
+- name: "create ou=People branch"
+  when: not ldap_slave_replica
+  ldap_entry:
+    dn: "ou=People,{{ ldap_basedn }}"
+    objectClass: organizationalUnit
+    state: present
+    bind_dn: "{{ ldap_data_admin_dn }}"
+    bind_pw: "{{ ldap_data_password }}"
+
+# overlays need to have index in their names, but the index depend on their number
+- name: "memberOf overlay"
+  when: ldap_memberOf_overlay
+  ldap_entry:
+    dn: "olcOverlay=memberof,olcDatabase={1}mdb,cn=config"
+    objectClass:
+      - olcConfig
+      - olcOverlayConfig
+      - olcMemberOf
+      - top
+    attributes:
+      olcMemberOfRefInt: "TRUE"
+    state: present
+
+- name: "refint overlay"
+  when: ldap_memberOf_overlay
+  ldap_entry:
+    dn: "olcOverlay=refint,olcDatabase={1}mdb,cn=config"
+    objectClass:
+      - olcConfig
+      - olcOverlayConfig
+      - olcRefintConfig
+      - top
+    attributes:
+      olcRefintAttribute: "memberof member manager owner"
+    state: present
+
+- name: "sssvlv overlay"
+  when: ldap_sssvlv_overlay
+  ldap_entry:
+    dn: "olcOverlay=sssvlv,olcDatabase={1}mdb,cn=config"
+    objectClass:
+      - olcConfig
+      - olcOverlayConfig
+      - top
+    state: present
+
+- name: "change the standard schema to allow empty groups"
+  when: ldap_allow_empty_groups
+  tags: hack
+  block:
+    - name: "copy core.ldif"
+      copy:
+        src: etc/ldap/schema/core.ldif
+        dest: /etc/ldap/schema/core.ldif
+      register: f1
+    - name: "copy core.schema"
+      copy:
+        src: etc/ldap/schema/core.schema
+        dest: /etc/ldap/schema/core.schema
+      register: f2
+    - name: "copy cn={0}core.ldif"
+      copy:
+        src: 'etc/ldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif'
+        dest: '/etc/ldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif'
+      register: f3
+    - name: "restart slapd"
+      when: f1.changed or f2.changed or f3.changed
+      service:
+        name: slapd
+        state: restarted
+
+- name: "slave replica"
+  when: ldap_slave_replica
+  block:
+    - name: "check existence of schema replication"
+      community.general.ldap_search:
+        dn: "olcDatabase={0}config,cn=config"
+        xorder_discovery: disable
+        scope: base
+      register: configdb
+
+    - name: "prepare attributes for schema replication"
+      set_fact:
+        cfgattrs:
+          olcSyncrepl: >-
+            {0}rid=002
+            provider={{ ldap_master_url }}
+            type=refreshAndPersist
+            retry="5 5 300 +"
+            searchbase="cn=schema,cn=config"
+            bindmethod=simple
+            binddn="cn=replication,{{ ldap_basedn }}"
+            credentials={{ ldap_replication_password }}
+            tls_cacert=/etc/ssl/certs/ca-certificates.crt
+
+    - name: "add olcMultiProvider if it is missing"
+      when: "'olcMultiProvider' not in configdb.results[0]"
+      set_fact:
+        cfgattrs: "{{ cfgattrs | combine({ 'olcMultiProvider': 'TRUE' }) }}"
+
+    - name: "set schema replication"
+      ldap_attrs:
+        dn: "olcDatabase={0}config,cn=config"
+        xorder_discovery: disable
+        attributes: "{{ cfgattrs }}"
+        ordered: yes
+        state: exact
+
+    - name: "check existence of data replication"
+      community.general.ldap_search:
+        dn: "olcDatabase={1}mdb,cn=config"
+        xorder_discovery: disable
+        scope: base
+      register: datadb
+
+    - name: "remove top object (it has different entryUUID than at the master)"
+      when: "'olcSyncrepl' not in datadb.results[0]"
+      ldap_entry:
+        state: absent
+        dn: "{{ ldap_basedn }}"
+        bind_dn: "{{ ldap_data_admin_dn }}"
+        bind_pw: "{{ ldap_data_password }}"
+
+    # see https://www.openldap.org/doc/admin25/slapdconf2.html#olcSyncrepl for replication parameters
+    - name: "data replication"
+      ldap_attrs:
+        dn: "olcDatabase={1}mdb,cn=config"
+        xorder_discovery: disable
+        attributes:
+          olcSyncrepl: >-
+            {0}rid=001
+            provider={{ ldap_master_url }}
+            type=refreshAndPersist
+            retry="5 5 300 +"
+            searchbase="{{ ldap_basedn }}"
+            schemachecking=off
+            bindmethod=simple
+            binddn="cn=replication,{{ ldap_basedn }}"
+            credentials={{ ldap_replication_password }}
+            tls_cacert=/etc/ssl/certs/ca-certificates.crt
+            logbase="cn=accesslog"
+            logfilter="(&(objectClass=auditWriteObject)(reqResult=0))"
+            syncdata=accesslog
+          olcUpdateRef: "{{ ldap_master_url }}"
+        ordered: yes
+        state: exact
